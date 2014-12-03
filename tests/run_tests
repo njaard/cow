@@ -1,0 +1,58 @@
+numpasses=0
+numfails=0
+
+function contains()
+{
+	a=$(cat $1)
+	b=$2
+	if [[ "$a" == "$b" ]]
+	then
+		numpasses=$(( $numpasses + 1 ))
+	else
+		numfails=$(( $numfails + 1 ))
+		caller
+		echo expected \"$b\", got \"$a\"
+	fi
+}
+
+function nofile()
+{
+	for i in $@
+	do
+		if test ! -e $i
+		then
+			numpasses=$(( $numpasses + 1 ))
+		else
+			numfails=$(( $numfails + 1 ))
+			caller
+			echo file \"$i\" exists
+		fi
+	done
+}
+
+for i in `find . -name '*.t'`
+do
+	source $i
+	fusermount -u testdir/mnt 2> /dev/null
+	mkdir -p testdir/src
+	mkdir -p testdir/mnt
+	HERE=$PWD
+	{
+		cd testdir/src
+		pre
+		cd $HERE
+	}
+	../cow_fuse -f testdir/src testdir/mnt &
+	sleep .5
+	{
+		cd testdir/mnt
+		post
+		cd $HERE
+	}
+	fusermount -u testdir/mnt
+	wait
+	rm -rf testdir
+done
+
+
+
