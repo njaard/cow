@@ -214,6 +214,27 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 				.arg(path).execValue<unsigned>();
 			if (c > 0)
 				return -ENOENT;
+			
+			// and we gotta make sure it hasn't been resized
+			try
+			{
+				stbuf->st_size
+					= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
+							"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
+							"and length(data)!=4096"
+						)
+						.arg(stbuf->st_size)
+						.arg(path)
+						.arg(path)
+						.execValue<uint64_t>();
+			}
+			catch (no_rows&)
+			{}
+			catch (std::exception&e)
+			{
+				std::cerr << "failure reading fsz: " << e.what() << std::endl;
+				return -EIO;
+			}
 			return 0;
 		}
 	}
@@ -380,6 +401,8 @@ struct cow_file_info
 		if (fd != -1)
 			::close(fd);
 	}
+	
+	std::vector<bool> historical_blocks_present;
 };
 
 
@@ -430,12 +453,31 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 		info->oldpath = path;
 	}
 
-	if (info->is_original)
+	if (!info->is_original)
 	{
 		unsigned count = db.statement("select count(*) from new_files where path=?")
 			.arg(info->newpath).execValue<unsigned>();
 		info->is_new = (count > 0);
 	}
+	
+	if (!info->is_new)
+	{
+		const uint64_t sz
+			= db.statement("select coalesce(max(offset),0) from historical_filedata where path=?")
+				.arg(info->oldpath)
+				.execValue<uint64_t>();
+		
+		std::vector<bool>& historical_blocks_present = info->historical_blocks_present;
+		historical_blocks_present.resize((sz / 4096)+1, false);
+
+		db.statement("select offset from historical_filedata where path=?")
+			.arg(info->oldpath)
+			.exec(Args<uint64_t>(), [&historical_blocks_present] (const std::tuple<uint64_t> &t) 
+			{
+				historical_blocks_present[std::get<0>(t)/4096]=true;
+			});
+	}
+	
 
 	// TODO test if this file is deleted in the working tree
 	int fd = open((origin_path + info->newpath).c_str(), flags);
@@ -519,6 +561,11 @@ static int cow_read(const char *path, char *buf, size_t size, off_t offset, stru
 				if (actuallyRead < 4096)
 					return offset - startOfRead;
 			}
+			catch (std::exception &e)
+			{
+				std::cerr << "failure: " << e.what() << std::endl;
+				return -EIO;
+			}
 		}
 		return offset - startOfRead;
 	}
@@ -543,46 +590,63 @@ static int cow_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 		return -errno;
 	
 	db.statement("insert into new_files values(?, 'create')").arg(path).exec();
-	cow_file_info *const info = reinterpret_cast<cow_file_info*>(fi->fh);
+	std::unique_ptr<cow_file_info> info(new cow_file_info);
+	fi->fh = reinterpret_cast<int64_t>(info.get());
 	info->oldpath = info->newpath = path;
 	info->fd = fd;
 	info->is_new = true;
 	info->is_original=false;
+	info.release();
 	return 0;
 }
 
-static void mergeData(int fd, const char *path, off_t begin, size_t bytes, size_t fsize)
+static void mergeData(
+	int fd,
+	std::vector<bool> &historical_blocks_present,
+	const char *path, off_t begin, size_t bytes, size_t fsize
+)
 {
+	// it's possible that historical_blocks_present is empty incorrectly
 	std::array<char, 4096> reading;
 	
-	off_t startingBlock = (begin >> 12) << 12;
+	size_t startingBlock = (begin >> 12) << 12;
 	
 	size_t lastBlockSize=0;
 	
-	while (size_t(startingBlock) < begin+bytes+4096 && size_t(startingBlock) < fsize)
+	while (startingBlock < begin+bytes+4096 && startingBlock < fsize)
 	{
 		// read the data that's being replaced
-		const ssize_t r = pread(fd, reading.data(), 4096, startingBlock);
-		if (r == -1)
+		
+		if (historical_blocks_present.size() <= startingBlock/4096 || historical_blocks_present[startingBlock/4096])
 		{
-			throw std::runtime_error("failed to read: " + std::to_string(errno));
-		}
-		
-		lastBlockSize = r;
-		
-		// and put what's being replaced into the historical data
-		db.statement("insert or ignore into historical_filedata values(?,?,?)")
-			.arg(path)
-			.arg(startingBlock)
-			.argBlob(reinterpret_cast<unsigned char*>(reading.data()), r)
-			.exec();
+			const ssize_t r = pread(fd, reading.data(), 4096, startingBlock);
+			if (r == -1)
+			{
+				throw std::runtime_error("failed to read: " + std::to_string(errno));
+			}
+			
+			lastBlockSize = r;
+			
+			// and put what's being replaced into the historical data
+			db.statement("insert or ignore into historical_filedata values(?,?,?)")
+				.arg(path)
+				.arg(startingBlock)
+				.argBlob(reinterpret_cast<unsigned char*>(reading.data()), r)
+				.exec();
 
+			if (historical_blocks_present.size() > startingBlock/4096)
+				historical_blocks_present[startingBlock/4096]=true;
+		}
+		else
+			lastBlockSize = 4096;
+			
 		startingBlock += 4096;
 	}
 	
-	if (lastBlockSize == 4096)
+	if (lastBlockSize == 4096 && historical_blocks_present.size() >= startingBlock/4096)
 	{
 		// one more empty block to indicate EOF
+		historical_blocks_present[startingBlock/4096]=true;
 		db.statement("insert or ignore into historical_filedata values(?,?,?)")
 			.arg(path)
 			.arg(startingBlock)
@@ -704,9 +768,12 @@ static int cow_unlink(const char *path)
 			if (fd == -1)
 				return -EIO;
 			
+			
 			try
 			{
-				mergeData(fd, path, 0, buf.st_size, buf.st_size);
+				// this can be empty
+				std::vector<bool> historical_blocks_present;
+				mergeData(fd, historical_blocks_present, path, 0, buf.st_size, buf.st_size);
 			}
 			catch (...)
 			{
@@ -880,7 +947,7 @@ static int cow_write(const char *, const char *buf, size_t size, off_t offset, s
 			// read all the blocks from "path" that coincide with size and offset
 			// only record them into historical_filedata if there's a difference
 			// and it's not already in historical_filedata
-			mergeData(info->fd, info->oldpath.c_str(), offset, size, pos);
+			mergeData(info->fd, info->historical_blocks_present, info->oldpath.c_str(), offset, size, pos);
 		}
 		
 		ssize_t r = pwrite(info->fd, buf, size, offset);
@@ -915,9 +982,11 @@ static int cow_truncate(const char *path, off_t len)
 				return -EIO;
 			const off_t end = lseek(fd, 0, SEEK_END);
 			
+			
 			try
 			{
-				mergeData(fd, path, 0, end, end);
+				std::vector<bool> historical_blocks_present;
+				mergeData(fd, historical_blocks_present, path, 0, end, end);
 			}
 			catch (...)
 			{
@@ -962,14 +1031,6 @@ static int cow_fsync(const char *path, int datasync, struct fuse_file_info *)
 
 static void* cow_init(struct fuse_conn_info *)
 {
-	mkdir( (origin_path + "/.cow").c_str(), 0777 );
-	db.open(origin_path + "/.cow/history.db");
-	db.exec("pragma synchronous = NORMAL");
-	
-	db.exec("create table if not exists historical_files (path primary key, command, data)");
-	db.exec("create table if not exists new_files (path primary key, command)");
-	db.exec("create table if not exists historical_filedata (path, offset, data, primary key (path, offset))");
-	db.exec("create index if not exists historical_renames on historical_files (data,command)");
 	return nullptr;
 }
 
@@ -1005,21 +1066,30 @@ int main(int argc, char *argv[])
 	cow_oper.symlink = cow_symlink;
 	cow_oper.readlink = cow_readlink;
 
-	char** more_argv = new char*[argc];
-	more_argv[0] = argv[0];
+	std::vector<char*> more_argv;
+	more_argv.push_back(argv[0]);
 	bool has=false;
-	int at=1;
-	for (int i=1; i < argc; i++, at++)
+	for (int i=1; i < argc; i++)
 	{
 		if (argv[i][0] == '-' || has)
 		{
-			more_argv[at] = argv[i];
+			more_argv.push_back(argv[i]);
 			continue;
 		}
-		at--;
 		origin_path = argv[i];
 		has = true;
 	}
+	more_argv.push_back(const_cast<char*>("-s"));
+	
+	mkdir( (origin_path + "/.cow").c_str(), 0777 );
+	db.open(origin_path + "/.cow/history.db");
+	std::cerr << "opening " << (origin_path + "/.cow/history.db") << std::endl;
+	db.exec("pragma synchronous = NORMAL");
+	
+	db.exec("create table if not exists historical_files (path primary key, command, data)");
+	db.exec("create table if not exists new_files (path primary key, command)");
+	db.exec("create table if not exists historical_filedata (path, offset, data, primary key (path, offset))");
+	db.exec("create index if not exists historical_renames on historical_files (data,command)");
 
-	return fuse_main(argc-1, more_argv, &cow_oper, nullptr);
+	return fuse_main(more_argv.size(), &more_argv.front(), &cow_oper, nullptr);
 }

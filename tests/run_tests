@@ -1,6 +1,15 @@
 numpasses=0
 numfails=0
 
+function maybe_stop()
+{
+	if $STOP_ON_FAILURE
+	then
+		echo Stopping on failure, cow_fuse still running
+		exit 1
+	fi
+}
+
 function contains()
 {
 	a=$(cat $1)
@@ -12,6 +21,7 @@ function contains()
 		numfails=$(( $numfails + 1 ))
 		caller
 		echo expected \"$b\", got \"$a\"
+		maybe_stop
 	fi
 }
 
@@ -26,31 +36,90 @@ function nofile()
 			numfails=$(( $numfails + 1 ))
 			caller
 			echo file \"$i\" exists
+			maybe_stop
 		fi
 	done
 }
 
-for i in `find . -name '*.t'`
+function matches()
+{
+	a="$1"
+	b="$2"
+	if diff "$a" "$b" 2> /dev/null > /dev/null
+	then
+		numpasses=$(( $numpasses + 1 ))
+	else
+		numfails=$(( $numfails + 1 ))
+		caller
+		echo files \"$a\" and \"$b\" do not match
+		maybe_stop
+	fi
+}
+
+STOP_ON_FAILURE=false
+tests=`find . -name '*.t'`
+stop_on_end=false
+for i in "$@"
 do
+	case "$i" in
+	"-h" | "--help")
+		echo "options: [--valgrind] [--stop-on-failure|-s] [... test names]"
+		exit 1
+		;;
+	"--valgrind" | "-v")
+		CMD_PREFIX="valgrind --log-file=log.%p"
+		;;
+	"--strace")
+		CMD_PREFIX="strace"
+		;;
+	"--stop-on-failure" | "-s")
+		STOP_ON_FAILURE=true
+		;;
+	"-*" )
+		echo "Unknown option $i"
+		exit 1
+		;;
+	*)
+		tests="$i"
+		stop_on_end=true
+		;;
+	esac
+
+done
+
+for i in $tests
+do
+	echo running $i
 	source $i
 	fusermount -u testdir/mnt 2> /dev/null
+	rm -rf testdir
 	mkdir -p testdir/src
 	mkdir -p testdir/mnt
 	HERE=$PWD
 	{
-		cd testdir/src
+		cd testdir
 		pre
 		cd $HERE
 	}
-	../cow_fuse -f testdir/src testdir/mnt &
-	sleep .5
+	$CMD_PREFIX ../cow_fuse -f $PWD/testdir/src $PWD/testdir/mnt &
+	while ! mount | grep -q $PWD/testdir/mnt
+	do
+		sleep .5
+	done
+
 	{
-		cd testdir/mnt
+		cd testdir
 		post
 		cd $HERE
 	}
-	fusermount -u testdir/mnt
-	wait
+	if $stop_on_end
+	then
+		echo "Stopping before killing fuse"
+		exit 1
+	else
+		fusermount -u testdir/mnt
+		wait
+	fi
 	rm -rf testdir
 done
 
