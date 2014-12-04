@@ -18,11 +18,11 @@
 
 #include "sql.h"
 
-std::string origin_path="/home/charles/tmp/cow_origin";
+std::string origin_path;
 
 Sql db;
 
-void put_int(std::string &to, int64_t x)
+static void put_int(std::string &to, int64_t x)
 {
 	to += char((x >> 8*7) & 0xff);
 	to += char((x >> 8*6) & 0xff);
@@ -34,7 +34,7 @@ void put_int(std::string &to, int64_t x)
 	to += char((x >> 0) & 0xff);
 }
 
-int64_t get_int(const std::string &to, unsigned position)
+static int64_t get_int(const std::string &to, unsigned position)
 {
 	int64_t val=0;
 	val |= int64_t(to[position + 0]) << 8*7;
@@ -366,6 +366,23 @@ static int cow_releasedir(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
+struct cow_file_info
+{
+	int fd=-1;
+	bool is_original=false;
+	bool is_new; // as opposed to historical, never true on "original"-path opens
+	
+	std::string oldpath; // the path of this file in the historic tree (before mv)
+	std::string newpath; // the path of this file in the working tree (after mv)
+	
+	~cow_file_info()
+	{
+		if (fd != -1)
+			::close(fd);
+	}
+};
+
+
 static int cow_open(const char *path, struct fuse_file_info *fi)
 {
 	if (is_dotcow(path))
@@ -375,55 +392,70 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 	flags &= ~O_APPEND;
 	flags |= O_RDWR;
 	
+	std::unique_ptr<cow_file_info> info(new cow_file_info);
+	fi->fh = reinterpret_cast<int64_t>(info.get());
+		
 	if (is_original(path))
 	{
+		info->is_original = true;
+		info->is_new = false;
+		
 		if (strcmp(path, dotOriginal)==0)
 			path = "/";
 		else
 			path = path+sizeof(dotOriginal)-1;
-		
-		std::string newpath = path;
-		try
-		{
-			newpath = 
-				db.statement("select data from historical_files where path=? and command='rename'")
-				.arg(path)
-				.execValue<std::string>();
-		}
-		catch (no_rows&)
-		{
-			newpath = path;
-		}
-		
-		int fd = open((origin_path + newpath).c_str(), flags);
-		fi->fh = fd;
-		return 0; // TODO, return error if it doesn't exist at all
 	}
 	
+	try
+	{
+		info->newpath = 
+			db.statement("select data from historical_files where path=? and command='rename'")
+			.arg(path)
+			.execValue<std::string>();
+	}
+	catch (no_rows&)
+	{
+		info->newpath = path;
+	}
 	
-	int fd = open((origin_path + path).c_str(), flags);
-	if (fd == -1)
-		return -errno;
-	fi->fh = fd;
-	return 0;
+	try
+	{
+		info->oldpath = 
+			db.statement("select data from historical_files where data=? and command='rename'")
+			.arg(path)
+			.execValue<std::string>();
+	}
+	catch (no_rows&)
+	{
+		info->oldpath = path;
+	}
+
+	if (info->is_original)
+	{
+		unsigned count = db.statement("select count(*) from new_files where path=?")
+			.arg(info->newpath).execValue<unsigned>();
+		info->is_new = (count > 0);
+	}
+
+	// TODO test if this file is deleted in the working tree
+	int fd = open((origin_path + info->newpath).c_str(), flags);
+	info->fd = fd;
+	info.release();
+	return 0; // TODO, return error if it doesn't exist at all
 }
 
-static int cow_release(const char *path, struct fuse_file_info *fi)
+static int cow_release(const char *, struct fuse_file_info *fi)
 {
-	if (is_original(path))
-	{
-		if (int(fi->fh) != -1)
-		close(fi->fh);
-	}
-	else
-	{
-		close(fi->fh);
-	}
+	cow_file_info *const info = reinterpret_cast<cow_file_info*>(fi->fh);
+	delete info;
+
 	return 0;
 }
 
 static int cow_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
+	cow_file_info *const info = reinterpret_cast<cow_file_info*>(fi->fh);
+	
 	if (is_original(path))
 	{
 		if (strcmp(path, dotOriginal)==0)
@@ -435,8 +467,6 @@ static int cow_read(const char *path, char *buf, size_t size, off_t offset, stru
 		// otherwise, read from the real file
 		
 		const off_t startOfRead = offset;
-		
-		const int fd = fi->fh;
 		
 		while (size > 0)
 		{
@@ -470,13 +500,13 @@ static int cow_read(const char *path, char *buf, size_t size, off_t offset, stru
 			catch (no_rows&)
 			{
 				// no overlap here, I have to satisfy this block from the real file
-				if (fd == -1)
+				if (info->fd == -1)
 					return -EIO;
 
 			
 				// I haven't started on a 4096 block boundary
 				const size_t delta = offset-startingBlock;
-				const ssize_t actuallyRead = pread(fd, buf, std::min<size_t>(4096, size), startingBlock+delta);
+				const ssize_t actuallyRead = pread(info->fd, buf, std::min<size_t>(4096, size), startingBlock+delta);
 				if (actuallyRead == -1)
 					return -errno;
 				
@@ -494,7 +524,7 @@ static int cow_read(const char *path, char *buf, size_t size, off_t offset, stru
 	}
 	else
 	{
-		ssize_t r = pread(fi->fh, buf, size, offset);
+		ssize_t r = pread(info->fd, buf, size, offset);
 		return r;
 	}
 }
@@ -513,7 +543,11 @@ static int cow_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 		return -errno;
 	
 	db.statement("insert into new_files values(?, 'create')").arg(path).exec();
-	fi->fh = fd;
+	cow_file_info *const info = reinterpret_cast<cow_file_info*>(fi->fh);
+	info->oldpath = info->newpath = path;
+	info->fd = fd;
+	info->is_new = true;
+	info->is_original=false;
 	return 0;
 }
 
@@ -832,38 +866,24 @@ static int cow_rename(const char *path, const char *newpath)
 	}
 }
 
-static int cow_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
+static int cow_write(const char *, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	tx tx(db);
 	
+	cow_file_info *const info = reinterpret_cast<cow_file_info*>(fi->fh);
+	
 	try
 	{
-		unsigned count = db.statement("select count(*) from new_files where path=?").arg(path).execValue<unsigned>();
-		
-		std::string oldpath;
-		try
+		if (!info->is_new)
 		{
-			oldpath = 
-				db.statement("select data from historical_files where data=? and command='rename'")
-				.arg(path)
-				.execValue<std::string>();
-		}
-		catch (no_rows&)
-		{
-			oldpath = path;
-		}
-		
-		
-		if (count == 0)
-		{
-			off_t pos = lseek(fi->fh, 0, SEEK_END);
+			off_t pos = lseek(info->fd, 0, SEEK_END);
 			// read all the blocks from "path" that coincide with size and offset
 			// only record them into historical_filedata if there's a difference
 			// and it's not already in historical_filedata
-			mergeData(fi->fh, oldpath.c_str(), offset, size, pos);
+			mergeData(info->fd, info->oldpath.c_str(), offset, size, pos);
 		}
 		
-		ssize_t r = pwrite(fi->fh, buf, size, offset);
+		ssize_t r = pwrite(info->fd, buf, size, offset);
 		if (r == -1)
 		{
 			tx.rollback();
@@ -944,6 +964,8 @@ static void* cow_init(struct fuse_conn_info *)
 {
 	mkdir( (origin_path + "/.cow").c_str(), 0777 );
 	db.open(origin_path + "/.cow/history.db");
+	db.exec("pragma synchronous = NORMAL");
+	
 	db.exec("create table if not exists historical_files (path primary key, command, data)");
 	db.exec("create table if not exists new_files (path primary key, command)");
 	db.exec("create table if not exists historical_filedata (path, offset, data, primary key (path, offset))");
