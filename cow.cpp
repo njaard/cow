@@ -19,8 +19,17 @@
 #include "sql.h"
 
 std::string origin_path;
+int origin_fd=-1;
 
 Sql db;
+
+static const char *atdir(const char *path)
+{
+	path++;
+	if (*path == '\0')
+		path = ".";
+	return path;
+}
 
 static void put_int(std::string &to, int64_t x)
 {
@@ -171,7 +180,7 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 			if (type == "rename")
 			{
 				newpath = std::get<1>(r);
-				int res = ::stat( (origin_path + newpath).c_str(), stbuf);
+				int res = ::fstatat( origin_fd, atdir(newpath.c_str()), stbuf, 0);
 				if (res == -1)
 					return -errno;
 			}
@@ -206,7 +215,7 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 		if (!is_known_historical)
 		{
 			// maybe the file is still there
-			int res = ::stat( (origin_path + newpath).c_str(), stbuf);
+			int res = ::fstatat( origin_fd, atdir(newpath.c_str()), stbuf, 0);
 			if (res == -1)
 				return -errno;
 			
@@ -246,7 +255,7 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 	}
 	else
 	{
-		int res = ::stat( (origin_path + path).c_str(), stbuf);
+		int res = ::fstatat( origin_fd, atdir(path), stbuf, 0);
 		if (res==0)
 			return 0;
 		else
@@ -264,7 +273,11 @@ static int cow_opendir(const char *path, struct fuse_file_info *fi)
 	}
 	else
 	{
-		DIR *d = opendir((origin_path + path).c_str());
+		int dfd = ::openat(origin_fd, atdir(path), O_DIRECTORY);
+		if (dfd == -1)
+			return -errno;
+		
+		DIR *d = fdopendir(dfd);
 		if (!d)
 			return -errno;
 		
@@ -326,32 +339,37 @@ static int cow_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
 				newPaths.insert(opath);
 			});
 		
-		DIR *d = opendir((origin_path + path ).c_str());
-		if (d)
+		const int dfd = ::openat(origin_fd, atdir(path), O_DIRECTORY);
+		if (dfd != -1)
 		{
-			while (true)
+			
+			DIR *d = fdopendir(dfd);
+			if (d)
 			{
-				dirent entry;
-				dirent *has;
-				readdir_r(d, &entry, &has);
-				if (!has)
-					break;
-				if (std::strcmp(entry.d_name, "/.cow") == 0)
-					continue;
-				if (renamedPaths.count(entry.d_name) >0)
+				while (true)
 				{
-					filler(buf, renamedPaths[entry.d_name].c_str(), nullptr, 0);
-					renamedPaths.erase(entry.d_name);
+					dirent entry;
+					dirent *has;
+					readdir_r(d, &entry, &has);
+					if (!has)
+						break;
+					if (std::strcmp(entry.d_name, "/.cow") == 0)
+						continue;
+					if (renamedPaths.count(entry.d_name) >0)
+					{
+						filler(buf, renamedPaths[entry.d_name].c_str(), nullptr, 0);
+						renamedPaths.erase(entry.d_name);
+					}
+					else if (deletedPaths.count(entry.d_name)>0)
+					{
+						deletedPaths.erase(entry.d_name);
+						filler(buf, entry.d_name, nullptr, 0);
+					}
+					else if (!newPaths.count(entry.d_name)>0)
+						filler(buf, entry.d_name, nullptr, 0);
 				}
-				else if (deletedPaths.count(entry.d_name)>0)
-				{
-					deletedPaths.erase(entry.d_name);
-					filler(buf, entry.d_name, nullptr, 0);
-				}
-				else if (!newPaths.count(entry.d_name)>0)
-					filler(buf, entry.d_name, nullptr, 0);
+				closedir(d);
 			}
-			closedir(d);
 		}
 		for (const std::string &x : deletedPaths)
 			filler(buf, x.c_str(), nullptr, 0);
@@ -491,7 +509,7 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 	fi->fh = reinterpret_cast<int64_t>(info.get());
 	
 	// TODO test if this file is deleted in the working tree
-	int fd = open((origin_path + info->newpath).c_str(), flags);
+	int fd = openat(origin_fd, atdir(info->newpath.c_str()), flags);
 	info->fd = fd;
 	info.release();
 	return 0; // TODO, return error if it doesn't exist at all
@@ -596,7 +614,7 @@ static int cow_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	flags &= ~O_APPEND;
 	flags |= O_RDWR;
 	
-	int fd = ::open((origin_path + path).c_str(), flags, mode);
+	int fd = ::openat(origin_fd, atdir(path), flags, mode);
 	if (fd == -1)
 		return -errno;
 	
@@ -672,7 +690,7 @@ static int cow_mkdir(const char *path, mode_t mode)
 	if (is_dotcow(path))
 		return -EACCES;
 	struct stat buf;
-	if (stat((origin_path + path).c_str(), &buf) == 0)
+	if (::fstatat(origin_fd, atdir(path), &buf, 0) == 0)
 	{
 		return -EEXIST;
 	}
@@ -682,7 +700,7 @@ static int cow_mkdir(const char *path, mode_t mode)
 	{
 		db.statement("insert into new_files values(?, 'mkdir')").arg(path).exec();
 		
-		int r = ::mkdir((origin_path + path).c_str(), mode);
+		int r = ::mkdirat(origin_fd, atdir(path), mode);
 		if (r == 0)
 			return 0;
 		tx.rollback();
@@ -701,7 +719,7 @@ static int cow_rmdir(const char *path)
 	if (is_dotcow(path))
 		return -ENOENT;
 	struct stat buf;
-	if (stat((origin_path + path).c_str(), &buf) == 0)
+	if (::fstatat(origin_fd, atdir(path), &buf, 0) == 0)
 		return -EEXIST;
 	
 	tx tx(db);
@@ -721,7 +739,7 @@ static int cow_rmdir(const char *path)
 			db.statement("delete from new_files where path=?").arg(path).exec();
 		}
 		
-		int r = ::rmdir((origin_path + path).c_str());
+		int r = ::unlinkat(origin_fd, atdir(path), AT_REMOVEDIR);
 		if (r == 0)
 			return 0;
 		tx.rollback();
@@ -741,7 +759,7 @@ static int cow_unlink(const char *path)
 	if (is_dotcow(path))
 		return -ENOENT;
 	struct stat buf;
-	if (stat((origin_path + path).c_str(), &buf) == -1)
+	if (::fstatat(origin_fd, atdir(path), &buf, 0) == -1)
 	{
 		return -errno;
 	}
@@ -774,7 +792,7 @@ static int cow_unlink(const char *path)
 			}
 			
 			// and save its data
-			const int fd = ::open( (origin_path + path).c_str(), O_RDONLY);
+			const int fd = ::openat( origin_fd, atdir(path), O_RDONLY);
 			
 			if (fd == -1)
 				return -EIO;
@@ -797,7 +815,7 @@ static int cow_unlink(const char *path)
 			db.statement("delete from new_files where path=?").arg(path).exec();
 		}
 		
-		int r = ::unlink((origin_path + path).c_str());
+		int r = ::unlinkat(origin_fd, atdir(path), 0);
 		if (r == 0)
 			return 0;
 		tx.rollback();
@@ -840,7 +858,7 @@ static int cow_readlink(const char *path, char *buf, size_t bufsize)
 	}
 	else
 	{
-		ssize_t r = readlink((origin_path + path).c_str(), buf, bufsize);
+		ssize_t r = readlinkat(origin_fd, atdir(path), buf, bufsize);
 		if (r == -1)
 			return -errno;
 		return 0;
@@ -884,7 +902,7 @@ static int cow_rename(const char *path, const char *newpath)
 	if (is_dotcow(newpath))
 		return -EACCES;
 	struct stat buf;
-	if (stat((origin_path + path).c_str(), &buf) == -1)
+	if (::fstatat(origin_fd, atdir(path), &buf, 0) == -1)
 	{
 		return -errno;
 	}
@@ -928,7 +946,7 @@ static int cow_rename(const char *path, const char *newpath)
 			db.statement("update new_files set path=? where path=?").arg(path).arg(newpath).exec();
 		}
 		
-		int r = rename((origin_path + path).c_str(), (origin_path + newpath).c_str());
+		int r = ::renameat(origin_fd, atdir(path), origin_fd, atdir(newpath));
 		if (r == -1)
 		{
 			tx.rollback();
@@ -982,10 +1000,10 @@ static int cow_truncate(const char *path, off_t len)
 	tx tx(db);
 	
 	std::unique_ptr<cow_file_info> info = get_file_info(path);
-	info->fd = ::open( (origin_path + info->newpath).c_str(), O_RDONLY);
+	info->fd = ::openat( origin_fd, atdir(info->newpath.c_str()), O_RDWR);
 	
 	if (info->fd == -1)
-		return -EIO;
+		return -errno;
 	try
 	{
 		if (!info->is_new)
@@ -996,7 +1014,7 @@ static int cow_truncate(const char *path, off_t len)
 			mergeData(info->fd, historical_blocks_present, info->oldpath.c_str(), 0, end, end);
 		}
 		
-		int r = truncate((origin_path + info->newpath).c_str(), len);
+		int r = ftruncate(info->fd, len);
 		if (r == -1)
 		{
 			tx.rollback();
@@ -1016,7 +1034,7 @@ static int cow_truncate(const char *path, off_t len)
 
 static int cow_fsync(const char *path, int datasync, struct fuse_file_info *)
 {
-	int fd = open((origin_path + path).c_str(), O_RDONLY);
+	int fd = ::openat(origin_fd, atdir(path), O_RDONLY);
 	int rc;
 	if (datasync)
 		rc = fdatasync(fd);
@@ -1090,5 +1108,9 @@ int main(int argc, char *argv[])
 	db.exec("create table if not exists historical_filedata (path, offset, data, primary key (path, offset))");
 	db.exec("create index if not exists historical_renames on historical_files (data,command)");
 
+	origin_fd = ::open(origin_path.c_str(), O_DIRECTORY);
+	if (origin_fd == -1)
+		throw std::runtime_error("failed to open");
+	
 	return fuse_main(more_argv.size(), &more_argv.front(), &cow_oper, nullptr);
 }
