@@ -154,6 +154,10 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 		else
 			path = path+sizeof(dotOriginal)-1;
 		
+		std::string newpath = path;
+		
+		bool is_known_historical=false;
+		
 		try
 		{
 			std::tuple<std::string, std::string> r = 
@@ -162,14 +166,14 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 				.execTypes<std::string, std::string>();
 			
 			const std::string& type = std::get<0>(r);
+			is_known_historical=true;
 			
 			if (type == "rename")
 			{
-				const std::string& newname = std::get<1>(r);
-				int res = ::stat( (origin_path + newname).c_str(), stbuf);
+				newpath = std::get<1>(r);
+				int res = ::stat( (origin_path + newpath).c_str(), stbuf);
 				if (res == -1)
 					return -errno;
-				return 0;
 			}
 			else
 			{
@@ -193,13 +197,16 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 				stbuf->st_size = db.statement("select length(data)+offset from historical_filedata where path=? order by offset desc limit 1")
 					.arg(path)
 					.execValue<size_t>();
+				return 0;
 			}
-			return 0;
 		}
 		catch (no_rows&)
+		{ }
+		
+		if (!is_known_historical)
 		{
 			// maybe the file is still there
-			int res = ::stat( (origin_path + path).c_str(), stbuf);
+			int res = ::stat( (origin_path + newpath).c_str(), stbuf);
 			if (res == -1)
 				return -errno;
 			
@@ -208,35 +215,34 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 				= db.statement("select count(*) from new_files where path=?").arg(path).execValue<unsigned>();
 			if (c > 0)
 				return -ENOENT;
-				
 			// and we gotta make sure it's not a rename
 			c = db.statement("select count(*) from historical_files where data=? and command='rename'")
 				.arg(path).execValue<unsigned>();
 			if (c > 0)
 				return -ENOENT;
-			
-			// and we gotta make sure it hasn't been resized
-			try
-			{
-				stbuf->st_size
-					= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
-							"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
-							"and length(data)!=4096"
-						)
-						.arg(stbuf->st_size)
-						.arg(path)
-						.arg(path)
-						.execValue<uint64_t>();
-			}
-			catch (no_rows&)
-			{}
-			catch (std::exception&e)
-			{
-				std::cerr << "failure reading fsz: " << e.what() << std::endl;
-				return -EIO;
-			}
-			return 0;
 		}
+			
+		// and we gotta make sure it hasn't been resized
+		try
+		{
+			stbuf->st_size
+				= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
+						"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
+						"and length(data)!=4096"
+					)
+					.arg(stbuf->st_size)
+					.arg(path)
+					.arg(path)
+					.execValue<uint64_t>();
+		}
+		catch (no_rows&)
+		{}
+		catch (std::exception&e)
+		{
+			std::cerr << "failure reading fsz: " << e.what() << std::endl;
+			return -EIO;
+		}
+		return 0;
 	}
 	else
 	{
@@ -405,18 +411,9 @@ struct cow_file_info
 	std::vector<bool> historical_blocks_present;
 };
 
-
-static int cow_open(const char *path, struct fuse_file_info *fi)
+static std::unique_ptr<cow_file_info> get_file_info(const char *path)
 {
-	if (is_dotcow(path))
-		return -ENOENT;
-	int flags = fi->flags;
-	flags &= ~O_WRONLY;
-	flags &= ~O_APPEND;
-	flags |= O_RDWR;
-	
 	std::unique_ptr<cow_file_info> info(new cow_file_info);
-	fi->fh = reinterpret_cast<int64_t>(info.get());
 		
 	if (is_original(path))
 	{
@@ -444,7 +441,7 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 	try
 	{
 		info->oldpath = 
-			db.statement("select data from historical_files where data=? and command='rename'")
+			db.statement("select path from historical_files where data=? and command='rename'")
 			.arg(path)
 			.execValue<std::string>();
 	}
@@ -477,8 +474,22 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 				historical_blocks_present[std::get<0>(t)/4096]=true;
 			});
 	}
-	
+	return info;
+}
 
+
+static int cow_open(const char *path, struct fuse_file_info *fi)
+{
+	if (is_dotcow(path))
+		return -ENOENT;
+	int flags = fi->flags;
+	flags &= ~O_WRONLY;
+	flags &= ~O_APPEND;
+	flags |= O_RDWR;
+	
+	std::unique_ptr<cow_file_info> info = get_file_info(path);
+	fi->fh = reinterpret_cast<int64_t>(info.get());
+	
 	// TODO test if this file is deleted in the working tree
 	int fd = open((origin_path + info->newpath).c_str(), flags);
 	info->fd = fd;
@@ -970,33 +981,22 @@ static int cow_truncate(const char *path, off_t len)
 {
 	tx tx(db);
 	
+	std::unique_ptr<cow_file_info> info = get_file_info(path);
+	info->fd = ::open( (origin_path + info->newpath).c_str(), O_RDONLY);
+	
+	if (info->fd == -1)
+		return -EIO;
 	try
 	{
-		unsigned count = db.statement("select count(*) from new_files where path=?").arg(path).execValue<unsigned>();
-		
-		if (count == 0)
+		if (!info->is_new)
 		{
-			const int fd = ::open( (origin_path + path).c_str(), O_RDONLY);
+			const off_t end = lseek(info->fd, 0, SEEK_END);
 			
-			if (fd == -1)
-				return -EIO;
-			const off_t end = lseek(fd, 0, SEEK_END);
-			
-			
-			try
-			{
-				std::vector<bool> historical_blocks_present;
-				mergeData(fd, historical_blocks_present, path, 0, end, end);
-			}
-			catch (...)
-			{
-				::close(fd);
-				throw;
-			}
-			::close(fd);
+			std::vector<bool> historical_blocks_present;
+			mergeData(info->fd, historical_blocks_present, info->oldpath.c_str(), 0, end, end);
 		}
 		
-		int r = truncate((origin_path + path).c_str(), len);
+		int r = truncate((origin_path + info->newpath).c_str(), len);
 		if (r == -1)
 		{
 			tx.rollback();
@@ -1083,7 +1083,6 @@ int main(int argc, char *argv[])
 	
 	mkdir( (origin_path + "/.cow").c_str(), 0777 );
 	db.open(origin_path + "/.cow/history.db");
-	std::cerr << "opening " << (origin_path + "/.cow/history.db") << std::endl;
 	db.exec("pragma synchronous = NORMAL");
 	
 	db.exec("create table if not exists historical_files (path primary key, command, data)");
