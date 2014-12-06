@@ -30,8 +30,8 @@ function contains()
 		numpasses=$(( $numpasses + 1 ))
 	else
 		numfails=$(( $numfails + 1 ))
-		trace
 		echo expected \"$b\", got \"$a\"
+		trace
 		maybe_stop
 	fi
 }
@@ -45,8 +45,8 @@ function nofile()
 			numpasses=$(( $numpasses + 1 ))
 		else
 			numfails=$(( $numfails + 1 ))
-			trace
 			echo file \"$i\" exists
+			trace
 			maybe_stop
 		fi
 	done
@@ -61,8 +61,8 @@ function matches()
 		numpasses=$(( $numpasses + 1 ))
 	else
 		numfails=$(( $numfails + 1 ))
-		trace
 		echo files \"$a\" and \"$b\" do not match
+		trace
 		maybe_stop
 	fi
 }
@@ -75,7 +75,7 @@ for i in "$@"
 do
 	case "$i" in
 	"-h" | "--help")
-		echo "options: [--valgrind] [--stop-on-failure|-s] [... test names]"
+		echo "options: [--valgrind] [--stop-on-failure|-s] [--prepare] [... test names]"
 		exit 1
 		;;
 	"--valgrind" | "-v")
