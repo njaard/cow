@@ -147,6 +147,155 @@ static bool is_dotcow(const char *path)
 	return false;
 }
 
+struct cow_file_info
+{
+	int fd=-1;
+	bool is_original=false;
+	
+	// never true on "original"-path opens:
+	bool is_new; // as opposed to historical
+	bool is_historical=false; // as opposed to new
+	bool removed=false; // as opposed to still existing
+	
+	std::string oldpath; // the path of this file in the historic tree (before mv)
+	std::string newpath; // the path of this file in the working tree (after mv)
+	
+	// if not new, the command, if any
+	std::string command;
+	std::string commanddata;
+	
+	ssize_t original_file_size=-1;
+	
+	cow_file_info(const char *path);
+	
+	~cow_file_info()
+	{
+		if (fd != -1)
+			::close(fd);
+	}
+	
+	std::vector<bool> historical_blocks_present;
+	
+	static std::unique_ptr<cow_file_info> make(const char *path)
+	{
+		return std::unique_ptr<cow_file_info>(new cow_file_info(path));
+	}
+};
+
+cow_file_info::cow_file_info(const char *path)
+{
+	if (::is_original(path))
+	{
+		is_original = true;
+		is_new = false;
+		
+		if (strcmp(path, dotOriginal)==0)
+			path = "/";
+		else
+			path = path+sizeof(dotOriginal)-1;
+	}
+	
+	typedef Args<std::string,std::string> TwoStrings;
+	
+	newpath = path;
+	
+	is_historical = false;
+	
+	db.statement("select command,data from historical_files where path=?")
+		.arg(path)
+		.exec(TwoStrings(), [&] (const TwoStrings::tuple &args)
+		{
+			command= std::get<0>(args);
+			commanddata = std::get<1>(args);
+			
+			is_historical = true;
+			
+			if (command == "rename")
+			{
+				newpath = commanddata;
+			}
+			else if (command == "removed")
+			{
+				newpath = "";
+				removed = true;
+			}
+		});
+	
+	
+	if (!is_original)
+	{
+		unsigned count = db.statement("select count(*) from new_files where path=?")
+			.arg(newpath).execValue<unsigned>();
+		is_new = (count > 0);
+		newpath = path;
+	}
+	
+	if (!is_new)
+		is_historical = true; // later on, we might set this to false
+
+	try
+	{
+		oldpath = 
+			db.statement("select path from historical_files where data=? and command='rename'")
+			.arg(path)
+			.execValue<std::string>();
+		is_historical = false;
+	}
+	catch (no_rows&)
+	{
+		oldpath = path;
+	}
+	
+	if (!is_new)
+	{
+		// if the file is not new, then its size is:
+		//   if the historical_filedata has a blocksize < 4096, then that is the last block
+		//   otherwise, it's the length of the true file
+		
+		try
+		{
+			original_file_size
+				= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
+						"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
+						"and length(data)!=4096"
+					)
+					.arg(-1)
+					.arg(path)
+					.arg(path)
+					.execValue<uint64_t>();
+		}
+		catch (no_rows&) { }
+		
+		if (original_file_size == -1)
+		{
+			// if I don't know the end of the file from the historical_filedata,
+			// then it must be in the working dir
+			struct stat stbuf;
+			int res = ::fstatat( origin_fd, atdir(newpath.c_str()), &stbuf, 0);
+			if (res == -1)
+			{
+				is_historical = false;
+				return;
+			}
+			original_file_size = stbuf.st_size;
+		}
+		
+		// now let's gather a list of blocks that are present
+		const uint64_t sz
+			= db.statement("select coalesce(max(offset),0) from historical_filedata where path=?")
+				.arg(oldpath)
+				.execValue<uint64_t>();
+		
+		historical_blocks_present.resize((sz / 4096)+1, false);
+
+		db.statement("select offset from historical_filedata where path=?")
+			.arg(oldpath)
+			.exec(Args<uint64_t>(), [this] (const std::tuple<uint64_t> &t) 
+			{
+				historical_blocks_present[std::get<0>(t)/4096]=true;
+			});
+	}
+}
 
 static int cow_getattr(const char *path, struct stat *stbuf)
 {
@@ -156,100 +305,26 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 	
 	if (is_original(path))
 	{
-		// first, let's see if the historical data has this path
+		const std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
+		if (!info->is_historical)
+			return -ENOENT;
 		
-		if (strcmp(path, dotOriginal)==0)
-			path = "/";
+		if (info->is_new)
+			return -ENOENT;
+		
+		if (info->command == "rmdir" || info->command == "erased" || info->command == "erased_link")
+		{
+			*stbuf = deserialize_stat(info->commanddata);
+		}
 		else
-			path = path+sizeof(dotOriginal)-1;
-		
-		std::string newpath = path;
-		
-		bool is_known_historical=false;
-		
-		try
 		{
-			std::tuple<std::string, std::string> r = 
-				db.statement("select command,data from historical_files where path=?")
-				.arg(path)
-				.execTypes<std::string, std::string>();
-			
-			const std::string& type = std::get<0>(r);
-			is_known_historical=true;
-			
-			if (type == "rename")
-			{
-				newpath = std::get<1>(r);
-				int res = ::fstatat( origin_fd, atdir(newpath.c_str()), stbuf, 0);
-				if (res == -1)
-					return -errno;
-			}
-			else
-			{
-				const struct stat st = deserialize_stat(std::get<1>(r));
-				
-				*stbuf = st;
-				
-				if (type == "rmdir")
-				{
-					stbuf->st_mode = S_IFDIR;
-				}
-				else if (type == "erased")
-				{
-					stbuf->st_mode = S_IFREG;
-				}
-				else if (type == "erased_link")
-				{
-					stbuf->st_mode = S_IFLNK;
-				}
-				
-				stbuf->st_size = db.statement("select length(data)+offset from historical_filedata where path=? order by offset desc limit 1")
-					.arg(path)
-					.execValue<size_t>();
-				return 0;
-			}
-		}
-		catch (no_rows&)
-		{ }
-		
-		if (!is_known_historical)
-		{
-			// maybe the file is still there
-			int res = ::fstatat( origin_fd, atdir(newpath.c_str()), stbuf, 0);
+			const int res = ::fstatat( origin_fd, atdir(info->newpath.c_str()), stbuf, 0);
 			if (res == -1)
-				return -errno;
-			
-			// but we gotta make sure it's not a new file
-			unsigned c
-				= db.statement("select count(*) from new_files where path=?").arg(path).execValue<unsigned>();
-			if (c > 0)
-				return -ENOENT;
-			// and we gotta make sure it's not a rename
-			c = db.statement("select count(*) from historical_files where data=? and command='rename'")
-				.arg(path).execValue<unsigned>();
-			if (c > 0)
-				return -ENOENT;
-		}
-			
-		// and we gotta make sure it hasn't been resized
-		try
-		{
-			stbuf->st_size
-				= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
-						"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
-						"and length(data)!=4096"
-					)
-					.arg(stbuf->st_size)
-					.arg(path)
-					.arg(path)
-					.execValue<uint64_t>();
-		}
-		catch (no_rows&)
-		{}
-		catch (std::exception&e)
-		{
-			std::cerr << "failure reading fsz: " << e.what() << std::endl;
-			return -EIO;
+			{
+				std::cerr << "failed to fstat the file which should be there" << std::endl;
+				return -1;
+			}
+			stbuf->st_size = info->original_file_size;
 		}
 		return 0;
 	}
@@ -411,90 +486,6 @@ static int cow_releasedir(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-struct cow_file_info
-{
-	int fd=-1;
-	bool is_original=false;
-	bool is_new; // as opposed to historical, never true on "original"-path opens
-	
-	std::string oldpath; // the path of this file in the historic tree (before mv)
-	std::string newpath; // the path of this file in the working tree (after mv)
-	
-	~cow_file_info()
-	{
-		if (fd != -1)
-			::close(fd);
-	}
-	
-	std::vector<bool> historical_blocks_present;
-};
-
-static std::unique_ptr<cow_file_info> get_file_info(const char *path)
-{
-	std::unique_ptr<cow_file_info> info(new cow_file_info);
-		
-	if (is_original(path))
-	{
-		info->is_original = true;
-		info->is_new = false;
-		
-		if (strcmp(path, dotOriginal)==0)
-			path = "/";
-		else
-			path = path+sizeof(dotOriginal)-1;
-	}
-	
-	try
-	{
-		info->newpath = 
-			db.statement("select data from historical_files where path=? and command='rename'")
-			.arg(path)
-			.execValue<std::string>();
-	}
-	catch (no_rows&)
-	{
-		info->newpath = path;
-	}
-	
-	try
-	{
-		info->oldpath = 
-			db.statement("select path from historical_files where data=? and command='rename'")
-			.arg(path)
-			.execValue<std::string>();
-	}
-	catch (no_rows&)
-	{
-		info->oldpath = path;
-	}
-
-	if (!info->is_original)
-	{
-		unsigned count = db.statement("select count(*) from new_files where path=?")
-			.arg(info->newpath).execValue<unsigned>();
-		info->is_new = (count > 0);
-	}
-	
-	if (!info->is_new)
-	{
-		const uint64_t sz
-			= db.statement("select coalesce(max(offset),0) from historical_filedata where path=?")
-				.arg(info->oldpath)
-				.execValue<uint64_t>();
-		
-		std::vector<bool>& historical_blocks_present = info->historical_blocks_present;
-		historical_blocks_present.resize((sz / 4096)+1, false);
-
-		db.statement("select offset from historical_filedata where path=?")
-			.arg(info->oldpath)
-			.exec(Args<uint64_t>(), [&historical_blocks_present] (const std::tuple<uint64_t> &t) 
-			{
-				historical_blocks_present[std::get<0>(t)/4096]=true;
-			});
-	}
-	return info;
-}
-
 
 static int cow_open(const char *path, struct fuse_file_info *fi)
 {
@@ -505,7 +496,7 @@ static int cow_open(const char *path, struct fuse_file_info *fi)
 	flags &= ~O_APPEND;
 	flags |= O_RDWR;
 	
-	std::unique_ptr<cow_file_info> info = get_file_info(path);
+	std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
 	fi->fh = reinterpret_cast<int64_t>(info.get());
 	
 	// TODO test if this file is deleted in the working tree
@@ -618,13 +609,14 @@ static int cow_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	if (fd == -1)
 		return -errno;
 	
-	db.statement("insert into new_files values(?, 'create')").arg(path).exec();
-	std::unique_ptr<cow_file_info> info(new cow_file_info);
+	std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
+	
 	fi->fh = reinterpret_cast<int64_t>(info.get());
 	info->oldpath = info->newpath = path;
 	info->fd = fd;
 	info->is_new = true;
 	info->is_original=false;
+	db.statement("insert into new_files values(?, 'create')").arg(path).exec();
 	info.release();
 	return 0;
 }
@@ -922,7 +914,7 @@ static int cow_rename(const char *path, const char *newpath)
 				std::string oldpath = db.statement("select path from historical_files where command='rename' and data=?")
 					.arg(path)
 					.execValue<std::string>();
-				if (oldpath == path)
+				if (oldpath == newpath)
 				{
 					// if newpath is the oldpath, then it's been un-renamed
 					db.statement("delete from historical_files where path=? and command='rename'").arg(oldpath).exec();
@@ -972,11 +964,13 @@ static int cow_write(const char *, const char *buf, size_t size, off_t offset, s
 	{
 		if (!info->is_new)
 		{
-			off_t pos = lseek(info->fd, 0, SEEK_END);
 			// read all the blocks from "path" that coincide with size and offset
 			// only record them into historical_filedata if there's a difference
 			// and it's not already in historical_filedata
-			mergeData(info->fd, info->historical_blocks_present, info->oldpath.c_str(), offset, size, pos);
+			mergeData(
+				info->fd, info->historical_blocks_present,
+				info->oldpath.c_str(),
+				offset, size, info->original_file_size);
 		}
 		
 		ssize_t r = pwrite(info->fd, buf, size, offset);
@@ -999,7 +993,7 @@ static int cow_truncate(const char *path, off_t len)
 {
 	tx tx(db);
 	
-	std::unique_ptr<cow_file_info> info = get_file_info(path);
+	std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
 	info->fd = ::openat( origin_fd, atdir(info->newpath.c_str()), O_RDWR);
 	
 	if (info->fd == -1)

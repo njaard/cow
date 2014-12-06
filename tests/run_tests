@@ -1,6 +1,17 @@
 numpasses=0
 numfails=0
 
+function trace()
+{
+	{
+		i=0
+		while caller $i
+		do
+			((i++))
+		done
+	} | awk '{ print $3, ":", $1, $2 }'
+}
+
 function maybe_stop()
 {
 	if $STOP_ON_FAILURE
@@ -19,7 +30,7 @@ function contains()
 		numpasses=$(( $numpasses + 1 ))
 	else
 		numfails=$(( $numfails + 1 ))
-		caller
+		trace
 		echo expected \"$b\", got \"$a\"
 		maybe_stop
 	fi
@@ -34,7 +45,7 @@ function nofile()
 			numpasses=$(( $numpasses + 1 ))
 		else
 			numfails=$(( $numfails + 1 ))
-			caller
+			trace
 			echo file \"$i\" exists
 			maybe_stop
 		fi
@@ -50,13 +61,14 @@ function matches()
 		numpasses=$(( $numpasses + 1 ))
 	else
 		numfails=$(( $numfails + 1 ))
-		caller
+		trace
 		echo files \"$a\" and \"$b\" do not match
 		maybe_stop
 	fi
 }
 
 STOP_ON_FAILURE=false
+STOP_ON_PREPARE=false
 tests=`find . -name '*.t'`
 stop_on_end=false
 for i in "$@"
@@ -74,6 +86,9 @@ do
 		;;
 	"--stop-on-failure" | "-s")
 		STOP_ON_FAILURE=true
+		;;
+	"--prepare")
+		STOP_ON_PREPARE=true
 		;;
 	"-*" )
 		echo "Unknown option $i"
@@ -102,6 +117,11 @@ do
 		cd $HERE
 	}
 	$CMD_PREFIX ../cow_fuse -f $PWD/testdir/src $PWD/testdir/mnt &
+	if $STOP_ON_PREPARE
+	then
+		echo "stopping after preparing"
+		exit 0
+	fi
 	while ! mount | grep -q $PWD/testdir/mnt
 	do
 		sleep .5
