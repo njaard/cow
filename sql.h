@@ -205,6 +205,8 @@ public:
 	};
 
 	void open(const std::string &database, int opt=Sql_WAL);
+	
+	bool isOpen() const { return !!db; }
 
 	Statement statement(const std::string &sql);
 

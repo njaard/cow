@@ -4,7 +4,7 @@
 
 Sql::Sql()
 {
-	db = 0;
+	db = nullptr;
 }
 
 Sql::~Sql()

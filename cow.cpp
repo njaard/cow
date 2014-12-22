@@ -156,6 +156,7 @@ struct cow_file_info
 	bool is_new; // as opposed to historical
 	bool is_historical=false; // as opposed to new
 	bool removed=false; // as opposed to still existing
+	bool is_directory=false; // this path is a directory name
 	
 	std::string oldpath; // the path of this file in the historic tree (before mv)
 	std::string newpath; // the path of this file in the working tree (after mv)
@@ -174,12 +175,24 @@ struct cow_file_info
 			::close(fd);
 	}
 	
+	
+	Sql& filedata()
+	{
+		if (!file_database.isOpen())
+		{
+			throw std::runtime_error("tried to get filedata on directory");
+		}
+		return file_database;
+	}
+	
 	std::vector<bool> historical_blocks_present;
 	
 	static std::unique_ptr<cow_file_info> make(const char *path)
 	{
 		return std::unique_ptr<cow_file_info>(new cow_file_info(path));
 	}
+private:
+	Sql file_database;
 };
 
 cow_file_info::cow_file_info(const char *path)
@@ -198,8 +211,18 @@ cow_file_info::cow_file_info(const char *path)
 	typedef Args<std::string,std::string> TwoStrings;
 	
 	newpath = path;
-	
 	is_historical = false;
+	
+	{
+		for (size_t i=1; i < newpath.size(); i++)
+		{
+			if (newpath[i]=='/')
+			{
+				std::string upto = newpath.substr(0, i-1);
+				::mkdirat(origin_fd, atdir(upto.c_str()), 0700);
+			}
+		}
+	}
 	
 	db.statement("select command,data from historical_files where path=?")
 		.arg(path)
@@ -252,21 +275,6 @@ cow_file_info::cow_file_info(const char *path)
 		//   if the historical_filedata has a blocksize < 4096, then that is the last block
 		//   otherwise, it's the length of the true file
 		
-		try
-		{
-			original_file_size
-				= db.statement("select coalesce(offset+length(data),?) from historical_filedata where path=? "
-						"and offset=(select coalesce(max(offset),0) from historical_filedata where path=?) "
-						"and length(data)!=4096"
-					)
-					.arg(-1)
-					.arg(path)
-					.arg(path)
-					.execValue<uint64_t>();
-		}
-		catch (no_rows&) { }
-		
-		if (original_file_size == -1)
 		{
 			// if I don't know the end of the file from the historical_filedata,
 			// then it must be in the working dir
@@ -278,22 +286,40 @@ cow_file_info::cow_file_info(const char *path)
 				return;
 			}
 			original_file_size = stbuf.st_size;
+			is_directory = S_ISDIR(stbuf.st_mode);
 		}
 		
-		// now let's gather a list of blocks that are present
-		const uint64_t sz
-			= db.statement("select coalesce(max(offset),0) from historical_filedata where path=?")
-				.arg(oldpath)
-				.execValue<uint64_t>();
-		
-		historical_blocks_present.resize((sz / 4096)+1, false);
+		if (!is_directory)
+		{
+			file_database.open(origin_path + dotCow + "/filedata/" + oldpath);
+			file_database.exec("pragma synchronous = NORMAL");
+			file_database.exec("create table if not exists historical_filedata (offset integer primary key, data)");
 
-		db.statement("select offset from historical_filedata where path=?")
-			.arg(oldpath)
-			.exec(Args<uint64_t>(), [this] (const std::tuple<uint64_t> &t) 
+			try
 			{
-				historical_blocks_present[std::get<0>(t)/4096]=true;
-			});
+				original_file_size
+					= filedata().statement("select coalesce(offset+length(data),?) from historical_filedata where "
+							"offset=(select coalesce(max(offset),0) from historical_filedata) "
+							"and length(data)!=4096"
+						)
+						.arg(-1)
+						.execValue<uint64_t>();
+			}
+			catch (no_rows&) { }
+		
+			// now let's gather a list of blocks that are present
+			const uint64_t sz
+				= file_database.statement("select coalesce(max(offset),0) from historical_filedata")
+					.execValue<uint64_t>();
+			
+			historical_blocks_present.resize((sz / 4096)+1, false);
+
+			file_database.statement("select offset from historical_filedata")
+				.exec(Args<uint64_t>(), [this] (const std::tuple<uint64_t> &t) 
+				{
+					historical_blocks_present[std::get<0>(t)/4096]=true;
+				});
+		}
 	}
 }
 
@@ -538,8 +564,7 @@ static int cow_read(const char *path, char *buf, size_t size, off_t offset, stru
 			
 			try
 			{
-				const std::string data = db.statement("select data from historical_filedata where path=? and offset=?")
-					.arg(path)
+				const std::string data = info->filedata().statement("select data from historical_filedata where offset=?")
 					.arg(startingBlock)
 					.execValue<std::string>();
 				
@@ -622,9 +647,9 @@ static int cow_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 }
 
 static void mergeData(
-	int fd,
+	cow_file_info *const info,
 	std::vector<bool> &historical_blocks_present,
-	const char *path, off_t begin, size_t bytes, size_t fsize
+	off_t begin, size_t bytes, size_t fsize
 )
 {
 	// it's possible that historical_blocks_present is empty incorrectly
@@ -640,7 +665,7 @@ static void mergeData(
 		
 		if (historical_blocks_present.size() <= startingBlock/4096 || historical_blocks_present[startingBlock/4096])
 		{
-			const ssize_t r = pread(fd, reading.data(), 4096, startingBlock);
+			const ssize_t r = pread(info->fd, reading.data(), 4096, startingBlock);
 			if (r == -1)
 			{
 				throw std::runtime_error("failed to read: " + std::to_string(errno));
@@ -649,8 +674,7 @@ static void mergeData(
 			lastBlockSize = r;
 			
 			// and put what's being replaced into the historical data
-			db.statement("insert or ignore into historical_filedata values(?,?,?)")
-				.arg(path)
+			info->filedata().statement("insert or ignore into historical_filedata values(?,?)")
 				.arg(startingBlock)
 				.argBlob(reinterpret_cast<unsigned char*>(reading.data()), r)
 				.exec();
@@ -668,8 +692,7 @@ static void mergeData(
 	{
 		// one more empty block to indicate EOF
 		historical_blocks_present[startingBlock/4096]=true;
-		db.statement("insert or ignore into historical_filedata values(?,?,?)")
-			.arg(path)
+		info->filedata().statement("insert or ignore into historical_filedata values(?,?)")
 			.arg(startingBlock)
 			.argBlob("")
 			.exec();
@@ -756,6 +779,9 @@ static int cow_unlink(const char *path)
 		return -errno;
 	}
 	
+	std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
+
+	
 	tx tx(db);
 	try
 	{
@@ -794,7 +820,7 @@ static int cow_unlink(const char *path)
 			{
 				// this can be empty
 				std::vector<bool> historical_blocks_present;
-				mergeData(fd, historical_blocks_present, path, 0, buf.st_size, buf.st_size);
+				mergeData(info.get(), historical_blocks_present, 0, buf.st_size, buf.st_size);
 			}
 			catch (...)
 			{
@@ -968,8 +994,7 @@ static int cow_write(const char *, const char *buf, size_t size, off_t offset, s
 			// only record them into historical_filedata if there's a difference
 			// and it's not already in historical_filedata
 			mergeData(
-				info->fd, info->historical_blocks_present,
-				info->oldpath.c_str(),
+				info, info->historical_blocks_present,
 				offset, size, info->original_file_size);
 		}
 		
@@ -1005,7 +1030,7 @@ static int cow_truncate(const char *path, off_t len)
 			const off_t end = lseek(info->fd, 0, SEEK_END);
 			
 			std::vector<bool> historical_blocks_present;
-			mergeData(info->fd, historical_blocks_present, info->oldpath.c_str(), 0, end, end);
+			mergeData(info.get(), historical_blocks_present, 0, end, end);
 		}
 		
 		int r = ftruncate(info->fd, len);
@@ -1093,13 +1118,13 @@ int main(int argc, char *argv[])
 	}
 	more_argv.push_back(const_cast<char*>("-s"));
 	
-	mkdir( (origin_path + "/.cow").c_str(), 0777 );
-	db.open(origin_path + "/.cow/history.db");
+	mkdir( (origin_path + dotCow ).c_str(), 0777 );
+	mkdir( (origin_path + dotCow+ "/filedata").c_str(), 0777 );
+	db.open(origin_path + dotCow+ "/history.db");
 	db.exec("pragma synchronous = NORMAL");
 	
 	db.exec("create table if not exists historical_files (path primary key, command, data)");
 	db.exec("create table if not exists new_files (path primary key, command)");
-	db.exec("create table if not exists historical_filedata (path, offset, data, primary key (path, offset))");
 	db.exec("create index if not exists historical_renames on historical_files (data,command)");
 
 	origin_fd = ::open(origin_path.c_str(), O_DIRECTORY);
