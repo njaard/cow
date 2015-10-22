@@ -11,8 +11,6 @@ exists. `cow_fuse` then replaces that filesystem with an identical one. Any chan
 be it the contents modified, file modes changed, files renamed, or new files added are recorded, with the original
 directory structure still accessible.
 
-For now, replacing a filesystem isn't quite supported.
-
 This software is still in development, so not only do I think there's bugs, I can nearly assure you of some.
 
 # Requirements
@@ -42,9 +40,9 @@ without any of the performance penalties associated with FUSE.
 
 ## Features
 
-The directory `data2` can be used as always. Inside `data2` is another directory
-named `.original` which doesn't get listed, even with `ls -a` (so that `cp -a` doesn't copy it). The 
-directory `.original` contains all files as they were before any changes were made to `data2`.
+The directory `data2` like any directory, except it's slower and has the COW feature. Inside `data2` is
+another directory named `.original` which doesn't get listed, even with `ls -a` (so that `cp -a` doesn't
+copy it). The directory `.original` contains all files as they were before any changes were made to `data2`.
 
 # Future Plans
 
@@ -65,8 +63,7 @@ and before committing.
 
 # Bugs
 
-Aside from being buggy in general (and in fact, I don't think it works at all right now), here
-are some problems:
+* Buggy in general. Don't trust it yet!
 
 * Since Linux provides no facility for filesystem atomicity, failures can cause corruptions
 in the snapshots, since a modification to the current file may be written to disk
@@ -74,6 +71,4 @@ before the history file is written. If a system failure occurs between these two
 then the snapshot will be wrong. Linux doesn't really ensure an order of writes which is highly
 unfortunate. The only way to fix this is for the current version to be stored in a special
 format and the history to remain as real filesystem entries.
-
-
 
