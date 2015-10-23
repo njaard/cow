@@ -23,6 +23,9 @@ int origin_fd=-1;
 
 Sql db;
 
+extern void register_openat_vfs();
+
+
 static const char *atdir(const char *path)
 {
 	path++;
@@ -300,7 +303,7 @@ cow_file_info::cow_file_info(const char *path)
 		
 		if (!is_directory)
 		{
-			file_database.open(origin_path + dotCow + "/filedata/" + oldpath);
+			file_database.open(std::string(dotCow+1) + "/filedata" + oldpath);
 			file_database.exec("pragma synchronous = NORMAL");
 			file_database.exec("create table if not exists historical_filedata (offset integer primary key, data)");
 
@@ -1107,17 +1110,36 @@ int main(int argc, char *argv[])
 	std::vector<char*> more_argv;
 	more_argv.push_back(argv[0]);
 	bool has=false;
+	bool second=false;
+	int origin_index=-1;
 	for (int i=1; i < argc; i++)
 	{
-		if (argv[i][0] == '-' || has)
+		if (argv[i][0] == '-')
 		{
 			more_argv.push_back(argv[i]);
-			continue;
 		}
-		origin_path = argv[i];
-		has = true;
+		else if (has)
+		{
+			more_argv.push_back(argv[i]);
+			second=true;
+		}
+		else
+		{
+			origin_path = argv[i];
+			origin_index = i;
+			has = true;
+		}
 	}
 	more_argv.push_back(const_cast<char*>("-s"));
+	more_argv.push_back(const_cast<char*>("-o"));
+	more_argv.push_back(const_cast<char*>("nonempty"));
+	if (origin_index == -1)
+	{
+		std::cerr << "Must specify a path to replace" << std::endl;
+		return 1;
+	}
+	if (!second)
+		more_argv.push_back(argv[origin_index]);
 	
 	mkdir( (origin_path + dotCow ).c_str(), 0777 );
 	mkdir( (origin_path + dotCow+ "/filedata").c_str(), 0777 );
@@ -1131,6 +1153,8 @@ int main(int argc, char *argv[])
 	origin_fd = ::open(origin_path.c_str(), O_DIRECTORY);
 	if (origin_fd == -1)
 		throw std::runtime_error("failed to open");
+	
+	register_openat_vfs();
 	
 	return fuse_main(more_argv.size(), &more_argv.front(), &cow_oper, nullptr);
 }

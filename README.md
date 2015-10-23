@@ -32,24 +32,18 @@ data called "data2":
 
 ## Mounting
 
-	mkdir data2
-	cow_fuse data data2
+	cow_fuse data
 
-Now, `data2` looks exactly like `data`. (`data` will get the directory `.cow` which stores history information).
-
-Any changes made to `data2` immediately get applied to `data`; you should not modify `data`, but you can read from it
-without any of the performance penalties associated with FUSE.
+Now, the directory `data` is replaced with a directory that keeps track of the original version. When you unmount, 
+you'll see a directory named `data/.cow` that contains information used for tracking the older version.
 
 ## Features
 
-The directory `data2` works like any directory, except it's slower and has the COW feature. Inside `data2` is
-another directory named `.original` which doesn't get listed, even with `ls -a` (so that `cp -a` doesn't
-copy it). The directory `.original` contains all files as they were before any changes were made to `data2`.
+The directory `data` works like any directory, except it's slower and has the COW feature. Inside `data` is
+another directory named `.original` which doesn't get listed, even with `ls -a`. The directory `.original`
+contains all files as they were before any changes were made to `data`.
 
 # Future Plans
-
-* My intent is that the command `cow_fuse data` replaces the directory `data` with itself, only with the COW feature. This 
-is nearly done, it's mostly just UI that is missing.
 
 * The GNU command `cp` has the option `--reflink=always` which is used for making
 Copy-On-Write copies of whole files; this should be supported.
