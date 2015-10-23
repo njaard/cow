@@ -67,6 +67,7 @@ static std::string binary_to_string(const std::vector<unsigned char> &a)
 static std::vector<unsigned char> serialize_stat(struct stat &st)
 {
 	std::vector<unsigned char> o;
+	o.reserve(8*10);
 	put_int(o, st.st_mode);
 	put_int(o, st.st_nlink);
 	put_int(o, st.st_uid);
