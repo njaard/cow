@@ -68,3 +68,6 @@ then the snapshot will be wrong. Linux doesn't really ensure an order of writes 
 unfortunate. The only way to fix this is for the current version to be stored in a special
 format and the history to remain as real filesystem entries.
 
+* If you modify a file so that it is the same as the original, some garbage collection can
+be done there.
+
