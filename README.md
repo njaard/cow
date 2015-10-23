@@ -1,6 +1,8 @@
 # STATUS
 
-Currently broken.
+Currently working!
+
+Well, the tests, at least.
 
 # Introduction
 
@@ -31,7 +33,7 @@ data called "data2":
 ## Mounting
 
 	mkdir data2
-    cow_fuse data data2
+	cow_fuse data data2
 
 Now, `data2` looks exactly like `data`. (`data` will get the directory `.cow` which stores history information).
 
@@ -40,7 +42,7 @@ without any of the performance penalties associated with FUSE.
 
 ## Features
 
-The directory `data2` like any directory, except it's slower and has the COW feature. Inside `data2` is
+The directory `data2` works like any directory, except it's slower and has the COW feature. Inside `data2` is
 another directory named `.original` which doesn't get listed, even with `ls -a` (so that `cp -a` doesn't
 copy it). The directory `.original` contains all files as they were before any changes were made to `data2`.
 
