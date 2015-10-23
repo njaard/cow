@@ -52,6 +52,23 @@ function nofile()
 	done
 }
 
+function exists()
+{
+	for i in $@
+	do
+		if test -e $i
+		then
+			numpasses=$(( $numpasses + 1 ))
+		else
+			numfails=$(( $numfails + 1 ))
+			echo file \"$i\" does not exist
+			trace
+			maybe_stop
+		fi
+	done
+}
+
+
 function matches()
 {
 	a="$1"

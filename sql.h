@@ -37,6 +37,14 @@ std::string get_sql_as_type<std::string>(sqlite3_stmt *const stmt, int col)
 }
 
 template<>
+std::vector<unsigned char> get_sql_as_type<std::vector<unsigned char>>(sqlite3_stmt *const stmt, int col)
+{
+	const unsigned char *bytes = static_cast<const unsigned char*>(sqlite3_column_blob(stmt, col));
+	const int count = sqlite3_column_bytes(stmt, col);
+	return std::vector<unsigned char>(bytes, bytes+count);
+}
+
+template<>
 std::shared_ptr<std::string> get_sql_as_type<std::shared_ptr<std::string>>(sqlite3_stmt *const stmt, int col)
 {
 	if (SQLITE_NULL == sqlite3_column_type(stmt, col))

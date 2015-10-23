@@ -31,37 +31,42 @@ static const char *atdir(const char *path)
 	return path;
 }
 
-static void put_int(std::string &to, int64_t x)
+static void put_int(std::vector<unsigned char> &to, uint64_t x)
 {
-	to += char((x >> 8*7) & 0xff);
-	to += char((x >> 8*6) & 0xff);
-	to += char((x >> 8*5) & 0xff);
-	to += char((x >> 8*4) & 0xff);
-	to += char((x >> 8*3) & 0xff);
-	to += char((x >> 8*2) & 0xff);
-	to += char((x >> 8*1) & 0xff);
-	to += char((x >> 0) & 0xff);
+	to.push_back( char((x >> 8*7) & 0xff) );
+	to.push_back( char((x >> 8*6) & 0xff) );
+	to.push_back( char((x >> 8*5) & 0xff) );
+	to.push_back( char((x >> 8*4) & 0xff) );
+	to.push_back( char((x >> 8*3) & 0xff) );
+	to.push_back( char((x >> 8*2) & 0xff) );
+	to.push_back( char((x >> 8*1) & 0xff) );
+	to.push_back( char((x >> 0) & 0xff) );
 }
 
-static int64_t get_int(const std::string &to, unsigned position)
+static uint64_t get_int(const std::vector<unsigned char> &to, unsigned position)
 {
-	int64_t val=0;
-	val |= int64_t(to[position + 0]) << 8*7;
-	val |= int64_t(to[position + 1]) << 8*6;
-	val |= int64_t(to[position + 2]) << 8*5;
-	val |= int64_t(to[position + 3]) << 8*4;
-	val |= int64_t(to[position + 4]) << 8*3;
-	val |= int64_t(to[position + 5]) << 8*2;
-	val |= int64_t(to[position + 6]) << 8*1;
-	val |= int64_t(to[position + 7]) << 8*0;
+	uint64_t val=0;
+	val |= uint64_t(to[8*position + 0]) << 8*7;
+	val |= uint64_t(to[8*position + 1]) << 8*6;
+	val |= uint64_t(to[8*position + 2]) << 8*5;
+	val |= uint64_t(to[8*position + 3]) << 8*4;
+	val |= uint64_t(to[8*position + 4]) << 8*3;
+	val |= uint64_t(to[8*position + 5]) << 8*2;
+	val |= uint64_t(to[8*position + 6]) << 8*1;
+	val |= uint64_t(to[8*position + 7]) << 8*0;
 	return val;
 }
 
-
-
-static std::string serialize_stat(struct stat &st)
+static std::string binary_to_string(const std::vector<unsigned char> &a)
 {
-	std::string o;
+	return std::string( reinterpret_cast<const char*>(&a[0]), reinterpret_cast<const char*>(&a[a.size()]));
+}
+
+
+
+static std::vector<unsigned char> serialize_stat(struct stat &st)
+{
+	std::vector<unsigned char> o;
 	put_int(o, st.st_mode);
 	put_int(o, st.st_nlink);
 	put_int(o, st.st_uid);
@@ -75,7 +80,7 @@ static std::string serialize_stat(struct stat &st)
 	return o;
 }
 
-static struct stat deserialize_stat(const std::string &x)
+static struct stat deserialize_stat(const std::vector<unsigned char> &x)
 {
 	struct stat st;
 	st.st_mode = get_int(x, 0);
@@ -163,7 +168,7 @@ struct cow_file_info
 	
 	// if not new, the command, if any
 	std::string command;
-	std::string commanddata;
+	std::vector<unsigned char> commanddata;
 	
 	ssize_t original_file_size=-1;
 	
@@ -208,7 +213,7 @@ cow_file_info::cow_file_info(const char *path)
 			path = path+sizeof(dotOriginal)-1;
 	}
 	
-	typedef Args<std::string,std::string> TwoStrings;
+	typedef Args<std::string,std::vector<unsigned char>> TwoStrings;
 	
 	newpath = path;
 	is_historical = false;
@@ -235,9 +240,9 @@ cow_file_info::cow_file_info(const char *path)
 			
 			if (command == "rename")
 			{
-				newpath = commanddata;
+				newpath = binary_to_string(commanddata);
 			}
-			else if (command == "removed")
+			else if (command == "erased")
 			{
 				newpath = "";
 				removed = true;
@@ -275,18 +280,21 @@ cow_file_info::cow_file_info(const char *path)
 		//   if the historical_filedata has a blocksize < 4096, then that is the last block
 		//   otherwise, it's the length of the true file
 		
+		if (!newpath.empty())
 		{
 			// if I don't know the end of the file from the historical_filedata,
 			// then it must be in the working dir
 			struct stat stbuf;
 			int res = ::fstatat( origin_fd, atdir(newpath.c_str()), &stbuf, 0);
-			if (res == -1)
+			if (res != -1)
+			{
+				original_file_size = stbuf.st_size;
+				is_directory = S_ISDIR(stbuf.st_mode);
+			}
+			else
 			{
 				is_historical = false;
-				return;
 			}
-			original_file_size = stbuf.st_size;
-			is_directory = S_ISDIR(stbuf.st_mode);
 		}
 		
 		if (!is_directory)
@@ -347,7 +355,7 @@ static int cow_getattr(const char *path, struct stat *stbuf)
 			const int res = ::fstatat( origin_fd, atdir(info->newpath.c_str()), stbuf, 0);
 			if (res == -1)
 			{
-				std::cerr << "failed to fstat the file which should be there" << std::endl;
+				std::cerr << "failed to fstat the file [origin]" << info->newpath << " which should be there" << std::endl;
 				return -1;
 			}
 			stbuf->st_size = info->original_file_size;
@@ -781,7 +789,6 @@ static int cow_unlink(const char *path)
 	
 	std::unique_ptr<cow_file_info> info = cow_file_info::make(path);
 
-	
 	tx tx(db);
 	try
 	{
@@ -810,22 +817,15 @@ static int cow_unlink(const char *path)
 			}
 			
 			// and save its data
-			const int fd = ::openat( origin_fd, atdir(path), O_RDONLY);
+			info->fd = ::openat( origin_fd, atdir(path), O_RDONLY);
 			
-			if (fd == -1)
+			if (info->fd == -1)
 				return -EIO;
 			
-			
-			try
 			{
 				// this can be empty
 				std::vector<bool> historical_blocks_present;
 				mergeData(info.get(), historical_blocks_present, 0, buf.st_size, buf.st_size);
-			}
-			catch (...)
-			{
-				::close(fd);
-				throw;
 			}
 		}
 		else
